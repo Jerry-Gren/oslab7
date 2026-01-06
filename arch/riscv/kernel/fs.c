@@ -583,44 +583,36 @@ static uint32_t sfs_create_inode(uint32_t parent_ino, const char *name, uint16_t
 
 int sfs_open(const char *path, uint32_t flags)
 {
-    // 0. 确保文件系统已挂载
     if (!is_sfs_mounted)
     {
         if (sfs_init() != 0)
             return -1;
     }
 
-    // 1. 路径检查
-    // [修复] 移除 path == NULL 的检查，因为 test5 在地址 0 处存放路径
+    // 允许 path 为地址 0 (test5 情况)，只要内容合法
     if (path[0] != '/')
         return -1;
 
-    // 2. 从根目录开始解析
-    uint32_t current_ino = 1; // Root Inode Blockno is 1
+    uint32_t current_ino = 1;
     uint32_t parent_ino = 1;
 
-    int i = 1; // 跳过第一个 '/'
+    int i = 1;
     char name[SFS_MAX_FILENAME_LEN + 1];
 
     while (path[i])
     {
-        // 提取路径分量 (Token)
         int j = 0;
         while (path[i] && path[i] != '/' && j < SFS_MAX_FILENAME_LEN)
         {
             name[j++] = path[i++];
         }
         name[j] = '\0';
-
-        // 跳过连续的 '/'
         while (path[i] == '/')
             i++;
 
-        // 在当前目录查找
         struct buf_head *bh = sb_bread(current_ino);
         struct sfs_inode *inode = (struct sfs_inode *)bh->data;
 
-        // 检查当前 inode 是否为目录
         if (inode->type != SFS_DIRECTORY)
         {
             brelse(bh);
@@ -629,7 +621,7 @@ int sfs_open(const char *path, uint32_t flags)
 
         uint32_t next_ino = 0;
 
-        // 如果当前是根目录(1) 且 查找目标是 "..", 则指向自己
+        // 处理根目录的 ..
         if (current_ino == 1 && strcmp(name, "..") == 0)
         {
             next_ino = 1;
@@ -639,40 +631,34 @@ int sfs_open(const char *path, uint32_t flags)
             next_ino = sfs_lookup(inode, name);
         }
 
+        // 关键修改：在进行创建操作前，先释放当前目录的 buffer 引用
+        // 这样 sfs_create_inode 内部获取 buffer 时是独占的（逻辑上），
+        // 且避免了嵌套引用可能带来的复杂性。
+        brelse(bh);
+
         if (next_ino == 0)
         {
-            // [修复] 路径分量不存在
             if (flags & SFS_FLAG_WRITE)
             {
-                // 如果有写权限，尝试创建
-                // 判断是创建目录还是文件：
-                // 如果 path[i] != '\0'，说明后面还有内容，当前分量必须是目录
-                // 如果 path[i] == '\0'，说明是路径最后一部分，创建为文件
+                // 判断是否是路径最后一段
+                // 如果 path[i] != '\0'，说明是中间目录，需要创建目录
                 uint16_t type = (path[i] != '\0') ? SFS_DIRECTORY : SFS_FILE;
 
-                // sfs_create_inode 会负责分配 inode、初始化(如果是目录则建立.和..)、并link到父目录
                 next_ino = sfs_create_inode(current_ino, name, type);
-
                 if (next_ino == 0)
-                {
-                    brelse(bh);
-                    return -1; // 创建失败（可能磁盘满）
-                }
+                    return -1;
             }
             else
             {
-                // 没写权限且文件不存在 -> 失败
-                brelse(bh);
                 return -1;
             }
         }
 
         parent_ino = current_ino;
         current_ino = next_ino;
-        brelse(bh);
+        // bh 已经在上面释放了，这里不需要再释放
     }
 
-    // 3. 分配文件描述符
     int fd = -1;
     for (int k = 0; k < 16; k++)
     {
@@ -683,9 +669,8 @@ int sfs_open(const char *path, uint32_t flags)
         }
     }
     if (fd == -1)
-        return -1; // 进程打开文件过多
+        return -1;
 
-    // 4. 初始化 struct file
     struct file *f = (struct file *)sfs_alloc(sizeof(struct file));
     f->ino = current_ino;
     f->parent_ino = parent_ino;
@@ -696,10 +681,6 @@ int sfs_open(const char *path, uint32_t flags)
     struct buf_head *bh = sb_bread(current_ino);
     struct sfs_inode *inode = (struct sfs_inode *)bh->data;
     f->size = inode->size;
-
-    // [补充逻辑] 如果以写模式打开文件，且需要截断 (O_TRUNC)，可以在这里处理
-    // 本实验暂不要求 O_TRUNC，且 test2/3 是追加或覆盖写，不需清空。
-
     brelse(bh);
 
     current->fs.fds[fd] = f;
@@ -883,10 +864,7 @@ int sfs_get_files(const char *path, char *files[])
     if (!is_sfs_mounted)
         sfs_init();
 
-    // 1. 打开目录获取 fd (复用 sfs_open 的逻辑)
-    // 这里为了避免文件描述符泄露，我们手动查找 inode
-    // 简化处理：直接调用 open 然后 read，最后 close
-
+    // 1. 打开目录
     int fd = sfs_open(path, SFS_FLAG_READ);
     if (fd < 0)
         return -1;
@@ -906,12 +884,12 @@ int sfs_get_files(const char *path, char *files[])
     int entry_count = inode->size / sizeof(struct sfs_entry);
     int entries_per_block = SFS_BLOCK_SIZE / sizeof(struct sfs_entry);
 
-    // 遍历所有数据块
     int processed = 0;
     int logical_blk = 0;
 
     while (processed < entry_count)
     {
+        // 读取目录数据块
         uint32_t phys_blk = sfs_bmap(inode, logical_blk++, false);
         if (phys_blk == 0)
             break;
@@ -921,13 +899,12 @@ int sfs_get_files(const char *path, char *files[])
 
         for (int i = 0; i < entries_per_block && processed < entry_count; i++)
         {
-            // 拷贝文件名到用户数组
-            // 注意：files[] 是用户态指针，还是内核态的 char* 数组?
-            // 根据 syscall.c 的实现，files 是 (char**)arg1，是一个指针数组。
-            // 我们假设 files[count] 指向了足够大的空间 (test5.c 中分配了)
-
-            sfs_memcpy(files[count], entries[i].filename, SFS_MAX_FILENAME_LEN + 1);
-            count++;
+            // 过滤掉 inode 为 0 的空项（如果存在）
+            if (entries[i].ino != 0)
+            {
+                sfs_memcpy(files[count], entries[i].filename, SFS_MAX_FILENAME_LEN + 1);
+                count++;
+            }
             processed++;
         }
         brelse(dbh);
