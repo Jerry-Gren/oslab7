@@ -42,7 +42,7 @@ int main() {
   for (;;) {
     n = 0;
 
-    printf("lab7@oslab: %s $ ", path);
+    printf("lab7@oslab: %s/ $ ", path + 2);
     for (;;) {
       ch = getchar_until_valid();
       printf("%c", ch);
@@ -77,7 +77,7 @@ int main() {
     }
 
     if (strcmp(input, "pwd") == 0) {
-      printf("%s\n", path);
+      printf("%s/\n", path + 2);
     }
 
     if (input[0] == 'c' && input[1] == 'd') {
@@ -133,6 +133,22 @@ int main() {
 }
 
 void path_add_entry(char *path, const char *entry) {
+  if (strcmp(entry, ".") == 0)
+    return;
+
+  char *end = path;
+  while (*end)
+    end++;
+
+  if (strcmp(entry, "..") == 0) {
+    if (strcmp(path, "/") == 0 || strcmp(path, "/.") == 0)
+      return;
+    end--;
+    while (end > path && *end != '/')
+      end--;
+    *end = '\0';
+    return;
+  }
   while (*path)
     path++;
   *path++ = '/';
